@@ -1,0 +1,21 @@
+name = "india-trade-explorer"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Static frontend assets
+[assets]
+directory = "./public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "india-trade-db"
+database_id = "993dd294-8d0f-4643-b1ca-d9c8d75853cc"
+
+[ai]
+binding = "AI"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+TRADESTAT_BASE = "https://tradestat.commerce.gov.in"

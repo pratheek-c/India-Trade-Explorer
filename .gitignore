@@ -1,0 +1,8 @@
+node_modules/
+dist/
+bun.lock
+.wrangler/
+*.log
+.DS_Store
+.env
+.dev.vars
