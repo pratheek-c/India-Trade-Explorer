@@ -1,25 +1,42 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 
-// ── Runtime ──
-// ponytail: CF Workers uses D1 binding from env; wrangler dev provides it locally
-
 // ── Shipment cost rates ──
 const SHIPMENT: Record<string, number> = {
   neighbor: 0.06, asia: 0.09, europe_africa: 0.13, americas_other: 0.16,
 };
 
 const COUNTRY_REGIONS: Record<string, string> = {
-  BD: "neighbor", NP: "neighbor", LK: "neighbor", PK: "neighbor", BT: "neighbor", MM: "neighbor",
-  CN: "asia", AE: "asia", SA: "asia", SG: "asia", JP: "asia", KR: "asia", HK: "asia",
-  QA: "asia", MY: "asia", ID: "asia", TH: "asia", VN: "asia", PH: "asia", IR: "asia",
-  IQ: "asia", KW: "asia", OM: "asia", BH: "asia", AU: "asia", NZ: "asia",
-  DE: "europe_africa", GB: "europe_africa", FR: "europe_africa", NL: "europe_africa",
-  ZA: "europe_africa", RU: "europe_africa", IT: "europe_africa", ES: "europe_africa",
-  CH: "europe_africa", BE: "europe_africa", TR: "europe_africa", NG: "europe_africa",
-  KE: "europe_africa", EG: "europe_africa", TZ: "europe_africa",
-  US: "americas_other", BR: "americas_other", CA: "americas_other", MX: "americas_other",
+  "050": "neighbor", "524": "neighbor", "144": "neighbor", "586": "neighbor", "064": "neighbor", "104": "neighbor",
+  "156": "asia", "784": "asia", "682": "asia", "702": "asia", "392": "asia", "410": "asia", "344": "asia",
+  "634": "asia", "458": "asia", "360": "asia", "764": "asia", "704": "asia", "608": "asia", "364": "asia",
+  "368": "asia", "414": "asia", "512": "asia", "048": "asia", "036": "asia", "554": "asia",
+  "276": "europe_africa", "826": "europe_africa", "250": "europe_africa", "528": "europe_africa",
+  "710": "europe_africa", "643": "europe_africa", "380": "europe_africa", "724": "europe_africa",
+  "756": "europe_africa", "056": "europe_africa", "792": "europe_africa", "566": "europe_africa",
+  "404": "europe_africa", "818": "europe_africa", "834": "europe_africa",
+  "842": "americas_other", "076": "americas_other", "124": "americas_other", "484": "americas_other",
 };
+
+// ── Country full names — ITC numeric codes (used by TradeMap API) ──
+const COUNTRY_NAMES: Record<string, string> = {
+  "842": "USA", "156": "China", "784": "UAE", "682": "Saudi Arabia", "702": "Singapore",
+  "392": "Japan", "410": "South Korea", "344": "Hong Kong", "634": "Qatar", "458": "Malaysia",
+  "360": "Indonesia", "764": "Thailand", "704": "Vietnam", "608": "Philippines", "364": "Iran",
+  "368": "Iraq", "414": "Kuwait", "512": "Oman", "048": "Bahrain", "036": "Australia", "554": "New Zealand",
+  "276": "Germany", "826": "United Kingdom", "250": "France", "528": "Netherlands",
+  "710": "South Africa", "643": "Russia", "380": "Italy", "724": "Spain",
+  "756": "Switzerland", "056": "Belgium", "792": "Turkiye", "566": "Nigeria",
+  "404": "Kenya", "818": "Egypt", "834": "Tanzania",
+  "050": "Bangladesh", "524": "Nepal", "144": "Sri Lanka", "586": "Pakistan", "064": "Bhutan", "104": "Myanmar",
+  "076": "Brazil", "124": "Canada", "484": "Mexico",
+};
+
+// ── Cookie helper ──
+function cookieFrom(resp: Response): string {
+  const raw = resp.headers.get("set-cookie") ?? "";
+  return String(raw).split(",").map((c: string) => c.split(";")[0]?.trim()).filter(Boolean).join("; ");
+}
 
 // ── Hono App ──
 const app = new Hono();
@@ -76,7 +93,7 @@ app.get("/api/trade/countries", async (c) => {
   return c.json((rows || []).map((r: any) => ({
     ...r,
     region: COUNTRY_REGIONS[r.code] ?? "asia",
-    name: r.code === "XX" ? "Aggregate" : r.code,
+    name: r.code === "XX" ? "Aggregate" : (COUNTRY_NAMES[r.code] ?? r.code),
   })));
 });
 
@@ -116,7 +133,6 @@ app.get("/api/trade/:type", async (c) => {
     const orderBy = orderMap[sort] ?? "t.trade_value_usd DESC";
     const where = conds.join(" AND ");
 
-    // ponytail: use helpers directly
     const countRow = await first(d, `SELECT COUNT(*) as c FROM trade_items t WHERE ${where}`, ...binds) as any;
     const total = countRow?.c ?? 0;
 
@@ -130,12 +146,12 @@ app.get("/api/trade/:type", async (c) => {
       const rate = SHIPMENT[region] ?? 0.16;
       return {
         id: r.id, productName: r.product_name, category: r.category_name ?? "", categoryCode: r.category_code,
-        type: r.trade_type, country: r.country_code === "XX" ? "Aggregate" : r.country_code, countryCode: r.country_code,
+        type: r.trade_type, country: r.country_code === "XX" ? "Aggregate" : (COUNTRY_NAMES[r.country_code] ?? r.country_code), countryCode: r.country_code,
         demandLevel: r.demand_level, tradeValueUsd: r.trade_value_usd, volume: r.volume, unit: r.unit,
         rank: i + 1 + offset,
         estShipmentCostUsd: Math.round(r.trade_value_usd * rate * 100) / 100,
-        shipmentCostEstimated: true, source: r.source ?? "TRADESTAT / DGFT",
-        sourceUrl: r.source_url ?? "https://tradestat.commerce.gov.in",
+        shipmentCostEstimated: true, source: r.source ?? "TradeMap / ITC",
+        sourceUrl: r.source_url ?? "https://trademap.org",
         lastUpdated: r.scraped_at ?? new Date().toISOString(),
       };
     });
@@ -145,8 +161,18 @@ app.get("/api/trade/:type", async (c) => {
   }
 });
 
+// ponytail: simple in-memory throttle — resets on cold start (good enough)
+let lastRefresh = 0;
+const REFRESH_COOLDOWN = 30_000; // 30 seconds
+
 // ── POST /api/trade/refresh ──
 app.post("/api/trade/refresh", async (c) => {
+  const now = Date.now();
+  if (now - lastRefresh < REFRESH_COOLDOWN) {
+    return c.json({ status: "throttled", retryAfter: Math.ceil((REFRESH_COOLDOWN - (now - lastRefresh)) / 1000) }, 429);
+  }
+  lastRefresh = now;
+
   const d = db(c);
   try {
     await scrapeNow(d);
@@ -154,6 +180,8 @@ app.post("/api/trade/refresh", async (c) => {
     const count = await first(d, "SELECT COUNT(*) as c FROM trade_items");
     return c.json({ status: "done", items: (count as any)?.c ?? 0, lastUpdated: (last as any)?.last });
   } catch (err: any) {
+    // ponytail: release throttle on failure so user can retry
+    lastRefresh = 0;
     return c.json({ status: "failed", error: err.message }, 500);
   }
 });
@@ -167,7 +195,7 @@ app.get("/api/ai/summary", async (c) => {
 
   const ev = exp?.v ?? 0, iv = imp?.v ?? 0;
   const summary = `India's trade data: exports $${ev.toFixed(0)}M, imports $${iv.toFixed(0)}M, balance $${(ev - iv).toFixed(0)}M${ev > iv ? " surplus." : " deficit."} ` +
-    `Top categories: ${(topCats || []).map((x: any) => x.name).join(", ")}. Data sourced from TRADESTAT (DGFT, Ministry of Commerce).`;
+    `Top categories: ${(topCats || []).map((x: any) => x.name).join(", ")}. Data sourced from TradeMap / ITC.`;
 
   return c.json({ insightType: "summary", insightText: summary, confidence: 0.85, generatedAt: new Date().toISOString(), totals: { exports: ev, imports: iv, balance: ev - iv }, topCategories: topCats });
 });
@@ -212,10 +240,10 @@ app.post("/api/ai/chat", async (c) => {
 
   if (lower.includes("export")) {
     const top = await all(d, "SELECT product_name, trade_value_usd FROM trade_items WHERE trade_type='export' ORDER BY trade_value_usd DESC LIMIT 5") as any[];
-    reply = `Top exports (TRADESTAT): ${top.map((x: any) => `${x.product_name} ($${x.trade_value_usd}M)`).join(", ") || "no data"}. Total: $${ev.toFixed(0)}M.`;
+    reply = `Top exports (TradeMap): ${top.map((x: any) => `${x.product_name} ($${x.trade_value_usd}M)`).join(", ") || "no data"}. Total: $${ev.toFixed(0)}M.`;
   } else if (lower.includes("import")) {
     const top = await all(d, "SELECT product_name, trade_value_usd FROM trade_items WHERE trade_type='import' ORDER BY trade_value_usd DESC LIMIT 5") as any[];
-    reply = `Top imports (TRADESTAT): ${top.map((x: any) => `${x.product_name} ($${x.trade_value_usd}M)`).join(", ") || "no data"}. Total: $${iv.toFixed(0)}M.`;
+    reply = `Top imports (TradeMap): ${top.map((x: any) => `${x.product_name} ($${x.trade_value_usd}M)`).join(", ") || "no data"}. Total: $${iv.toFixed(0)}M.`;
   } else if (lower.includes("balance") || lower.includes("deficit") || lower.includes("surplus")) {
     reply = `Trade balance: $${(ev - iv).toFixed(0)}M (${ev >= iv ? "surplus" : "deficit"}). Exports: $${ev.toFixed(0)}M, Imports: $${iv.toFixed(0)}M.`;
   } else if (lower.includes("category") || lower.includes("sector")) {
@@ -225,7 +253,7 @@ app.post("/api/ai/chat", async (c) => {
     const top = await all(d, "SELECT country_code, COALESCE(SUM(trade_value_usd),0) as v FROM trade_items GROUP BY country_code ORDER BY v DESC LIMIT 5") as any[];
     reply = `Top partners: ${top.map((x: any) => `${x.country_code} ($${x.v.toFixed(0)}M)`).join(", ") || "no data"}.`;
   } else {
-    reply = `India trade (TRADESTAT): exports $${ev.toFixed(0)}M, imports $${iv.toFixed(0)}M, balance $${(ev - iv).toFixed(0)}M. Ask about exports, imports, categories, countries, or balance.`;
+    reply = `India trade (TradeMap): exports $${ev.toFixed(0)}M, imports $${iv.toFixed(0)}M, balance $${(ev - iv).toFixed(0)}M. Ask about exports, imports, categories, countries, or balance.`;
   }
 
   return c.json({ role: "assistant", content: reply });
@@ -238,106 +266,52 @@ app.get("/api/scraping/log", async (c) => {
   return c.json(rows);
 });
 
-// ── GET /api/scraping/diag — diagnostic: try multiple POST strategies ──
-app.get("/api/scraping/diag", async (c) => {
-  const url = c.req.query("url") ?? "https://tradestat.commerce.gov.in/eidb/commodity_wise_export";
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-
-  const results: any[] = [];
-
-  // Step 1: GET page
-  const resp = await fetch(url, { headers: { "User-Agent": UA, "Accept": "text/html" } });
-  const html = await resp.text();
-  const cookies = resp.headers.get("set-cookie") ?? "";
-  const sessionCookie = String(cookies).split(",").map(c => c.split(";")[0]?.trim()).filter(Boolean).join("; ");
-  const csrf = html.match(/<input[^>]*name=["']_token["'][^>]*value=["']([^"']+)["']/)?.[1] ?? "";
-
-  // Extract form action URL if different
-  const formAction = html.match(/<form[^>]*action=["']([^"']+)["']/)?.[1] ?? url;
-  const formMethod = html.match(/<form[^>]*method=["']([^"']+)["']/)?.[1] ?? "POST";
-
-  const baseHeaders = {
-    "User-Agent": UA,
-    "Referer": url,
-    "Origin": "https://tradestat.commerce.gov.in",
-    "X-CSRF-TOKEN": csrf,
-    ...(sessionCookie ? { "Cookie": sessionCookie } : {}),
-  };
-
-  // Try 1: Standard form POST
-  const p1 = new URLSearchParams();
-  p1.set("_token", csrf); p1.set("comType", "all"); p1.set("EidbComLevelCwe", "2"); p1.set("EidbYearCwe", "2025-2026"); p1.set("Eidb_ReportCwe", "1");
-  const r1 = await fetch(formAction, { method: formMethod, headers: { ...baseHeaders, "Content-Type": "application/x-www-form-urlencoded" }, body: p1, redirect: "follow" });
-  results.push({ strategy: "form-post", status: r1.status, length: (await r1.clone().text()).length, title: ((await r1.clone().text()).match(/<title>([^<]+)<\/title>/)?.[1] ?? "") });
-
-  // Try 2: AJAX with JSON accept
-  const r2 = await fetch(formAction, { method: "POST", headers: { ...baseHeaders, "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }, body: p1 });
-  const t2 = await r2.text();
-  results.push({ strategy: "ajax-json", status: r2.status, length: t2.length, isJSON: t2.startsWith("{"), preview: t2.substring(0, 500) });
-
-  // Try 3: DataTables AJAX (common Laravel pattern)
-  const dtParams = new URLSearchParams();
-  dtParams.set("draw", "1");
-  dtParams.set("start", "0");
-  dtParams.set("length", "50");
-  dtParams.set("_token", csrf);
-  dtParams.set("comType", "all");
-  dtParams.set("EidbComLevelCwe", "2");
-  dtParams.set("EidbYearCwe", "2025-2026");
-  dtParams.set("Eidb_ReportCwe", "1");
-  const dtUrl = formAction + (formAction.includes("?") ? "&" : "?") + "draw=1&start=0&length=50";
-  const r3 = await fetch(formAction, { method: "POST", headers: { ...baseHeaders, "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }, body: dtParams });
-  const t3 = await r3.text();
-  results.push({ strategy: "datatables", status: r3.status, length: t3.length, isJSON: t3.startsWith("{"), preview: t3.substring(0, 500) });
-
-  // Try 4: GET with query params (some portals use GET for reports)
-  const qp = new URLSearchParams({ comType: "all", EidbComLevelCwe: "2", EidbYearCwe: "2025-2026", Eidb_ReportCwe: "1", _token: csrf });
-  const r4 = await fetch(formAction + "?" + qp.toString(), { headers: baseHeaders });
-  const t4 = await r4.text();
-  results.push({ strategy: "get-query", status: r4.status, length: t4.length, hasTable: t4.includes("<table"), preview: t4.substring(0, 500) });
-
-  return c.json({
-    url, formAction, formMethod,
-    csrfFound: !!csrf, cookiesPresent: !!sessionCookie,
-    pageHasAjax: html.includes("ajax") || html.includes("DataTable") || html.includes("$.ajax") || html.includes("fetch"),
-    pageScripts: (html.match(/<script[^>]*src=["']([^"']+)["']/g) ?? []).slice(0, 10).map(s => s.match(/src=["']([^"']+)["']/)?.[1]).filter(Boolean),
-    results,
-  });
-});
-
 // ────────────────────────────────────
 //  SCRAPER — TradeMap.org API (clean JSON, no CSRF)
 // ────────────────────────────────────
 
 async function scrapeNow(d: any) {
   const startTime = new Date().toISOString();
+  // ponytail: scrape into temp table, swap on success — no data loss on partial failure
+  await run(d, "DROP TABLE IF EXISTS _trade_new");
+  await run(d, "CREATE TABLE _trade_new (id INTEGER PRIMARY KEY AUTOINCREMENT, product_name TEXT NOT NULL, category_code TEXT NOT NULL, trade_type TEXT NOT NULL, country_code TEXT NOT NULL, trade_value_usd REAL NOT NULL, volume REAL, unit TEXT DEFAULT 'units', demand_level TEXT, source TEXT DEFAULT 'TradeMap', source_url TEXT, scraped_at TEXT DEFAULT (datetime('now')))");
+
+  let total = 0;
   try {
-    await run(d, "DELETE FROM trade_items");
-    let total = 0;
-    total += await scrapeTradeMap(d, "export");
-    total += await scrapeTradeMapImports(d);
-    await run(d, "INSERT INTO scraping_log(source,status,items_count,started_at) VALUES(?,?,?,?)", "trademap", total > 0 ? "success" : "partial", total, startTime);
-    console.log(`[scraper] ${total} items from TradeMap`);
+    total += await scrapeTradeMap(d, "_trade_new", "export");
+    total += await scrapeTradeMapImports(d, "_trade_new");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await run(d, "INSERT INTO scraping_log(source,status,error_msg,started_at) VALUES(?,?,?,?)", "trademap", "failed", msg, startTime);
+    await run(d, "DROP TABLE IF EXISTS _trade_new");
     console.error("[scraper]", msg);
+    return;
+  }
+
+  if (total > 0) {
+    // ponytail: atomic swap via batch (D1 batch runs in a transaction)
+    await d.batch([
+      d.prepare("DROP TABLE IF EXISTS _trade_old"),
+      d.prepare("ALTER TABLE trade_items RENAME TO _trade_old"),
+      d.prepare("ALTER TABLE _trade_new RENAME TO trade_items"),
+      d.prepare("DROP TABLE IF EXISTS _trade_old"),
+      d.prepare("INSERT INTO scraping_log(source,status,items_count,started_at) VALUES(?,?,?,?)").bind("trademap", "success", total, startTime),
+    ]);
+    console.log(`[scraper] ${total} items from TradeMap`);
+  } else {
+    await run(d, "DROP TABLE IF EXISTS _trade_new");
+    await run(d, "INSERT INTO scraping_log(source,status,items_count,started_at) VALUES(?,?,?,?)", "trademap", "partial", 0, startTime);
   }
 }
 
-async function scrapeTradeMap(d: any, tradeType: string): Promise<number> {
+async function scrapeTradeMap(d: any, table: string, tradeType: string): Promise<number> {
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
   const BASE = "https://www.trademap.org";
 
-  // Get session cookie
   const initResp = await fetch(`${BASE}/embedded_india-tradeconnect/Dashboard.aspx`, {
     headers: { "User-Agent": UA, "Accept": "text/html" },
   });
-  const rawCookies = initResp.headers.get("set-cookie") ?? "";
-  const sessionCookies = Array.isArray(rawCookies)
-    ? rawCookies.map(c => c.split(";")[0]?.trim()).filter(Boolean).join("; ")
-    : String(rawCookies).split(",").map(c => c.split(";")[0]?.trim()).filter(Boolean).join("; ");
-  const cookieHeader = sessionCookies + "; EmbeddedReferer=https://www.trade.gov.in/";
+  const cookieHeader = cookieFrom(initResp) + "; EmbeddedReferer=https://www.trade.gov.in/";
   const headers = { "User-Agent": UA, "Accept": "application/json", "Cookie": cookieHeader };
 
   const refYear = new Date().getFullYear() - 1;
@@ -353,14 +327,13 @@ async function scrapeTradeMap(d: any, tradeType: string): Promise<number> {
   for (const section of tmData.children ?? []) {
     for (const item of section.children ?? []) {
       const name = String(item.name ?? "");
-      const code = String(item.code ?? "").padStart(2, "0");
       const valueM = parseFloat(item.value ?? "0") / 1000; // thousands → millions USD
       if (valueM <= 0 || name.length < 2) continue;
 
       const catCode = classifyHS(name);
       const demand = valueM > 10000 ? "Very High" : valueM > 3000 ? "High" : valueM > 500 ? "Medium" : "Low";
       await run(d,
-        "INSERT INTO trade_items(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+        `INSERT INTO ${table}(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))`,
         name.substring(0, 200), catCode, tradeType, "XX", valueM, null, "units", demand, "TradeMap / ITC", tmUrl
       );
       count++;
@@ -377,7 +350,7 @@ async function scrapeTradeMap(d: any, tradeType: string): Promise<number> {
       const valueM = parseFloat(c.exported_value_usd ?? "0") / 1000;
       if (valueM <= 0) continue;
       await run(d,
-        "INSERT INTO trade_items(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+        `INSERT INTO ${table}(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))`,
         `Trade with ${c.name}`, "84", tradeType, c.code, valueM, null, "units",
         valueM > 5000 ? "Very High" : valueM > 1000 ? "High" : "Medium",
         "TradeMap / ITC", linUrl
@@ -390,24 +363,18 @@ async function scrapeTradeMap(d: any, tradeType: string): Promise<number> {
   return count;
 }
 
-async function scrapeTradeMapImports(d: any): Promise<number> {
+async function scrapeTradeMapImports(d: any, table: string): Promise<number> {
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
   const BASE = "https://www.trademap.org";
   const refYear = new Date().getFullYear() - 1;
 
   try {
-    // Get fresh session
     const initResp = await fetch(`${BASE}/embedded_india-tradeconnect/Dashboard.aspx`, {
       headers: { "User-Agent": UA, "Accept": "text/html" },
     });
-    const rawCookies = initResp.headers.get("set-cookie") ?? "";
-    const sessionCookies = Array.isArray(rawCookies)
-      ? rawCookies.map(c => c.split(";")[0]?.trim()).filter(Boolean).join("; ")
-      : String(rawCookies).split(",").map(c => c.split(";")[0]?.trim()).filter(Boolean).join("; ");
-    const headers = { "User-Agent": UA, "Accept": "application/json", "Cookie": sessionCookies + "; EmbeddedReferer=https://www.trade.gov.in/" };
+    const headers = { "User-Agent": UA, "Accept": "application/json", "Cookie": cookieFrom(initResp) + "; EmbeddedReferer=https://www.trade.gov.in/" };
 
     // ponytail: linear chart has exports AND balance. imports = exports - balance.
-    // This gives us country-level import data without needing a separate import endpoint.
     const linUrl = `${BASE}/api/Dashboard?chart=linear&countryCd=699&lang=en`;
     console.log(`[scraper:import] Linear: GET ${linUrl}`);
     const linResp = await fetch(linUrl, { headers });
@@ -422,7 +389,7 @@ async function scrapeTradeMapImports(d: any): Promise<number> {
 
         if (impV > 0) {
           await run(d,
-            "INSERT INTO trade_items(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+            `INSERT INTO ${table}(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))`,
             `Imports from ${c.name}`, "84", "import", c.code, impV, null, "units",
             impV > 5000 ? "Very High" : impV > 1000 ? "High" : "Medium",
             "TradeMap / ITC", linUrl
@@ -433,43 +400,31 @@ async function scrapeTradeMapImports(d: any): Promise<number> {
       console.log(`[scraper:import] ${count} country import entries from linear chart`);
     }
 
-    // Also try direct import treemap endpoints for HS-code breakdown
-    // ponytail: if found, verify values differ from exports (TradeMap may default to exports for unknown params)
-    const tmUrls = [
-      `${BASE}/api/Dashboard?chart=treemap&countryCd=699&flow=m&referenceYear=${refYear}&lang=en`,
-      `${BASE}/api/Dashboard?chart=treemap&countryCd=699&flow=-1&referenceYear=${refYear}&lang=en`,
-    ];
-    for (const url of tmUrls) {
-      console.log(`[scraper:import] Trying ${url}`);
-      const resp = await fetch(url, { headers });
+    // ponytail: import treemap — speculative, undocumented params; skip if empty data
+    // TradeMap may return export data regardless of flow param, so we only use this
+    // as a fallback when the linear chart gave us nothing.
+    if (count === 0) {
+      const tmUrl = `${BASE}/api/Dashboard?chart=treemap&countryCd=699&flow=m&referenceYear=${refYear}&lang=en`;
+      console.log(`[scraper:import] Treemap fallback: GET ${tmUrl}`);
+      const resp = await fetch(tmUrl, { headers });
       if (resp.ok) {
         const data = await resp.json() as any;
-        // Verify: does the first value differ from exports? If same, TradeMap returned exports.
-        if (data.children?.length > 0) {
-          const firstVal = parseFloat(data.children[0]?.children?.[0]?.value ?? "0");
-          const knownExportFirst = 22760; // Live animals export value in thousands (from HAR)
-          // Only store if values differ significantly (>10% difference) from known exports
-          if (firstVal > 0 && Math.abs(firstVal - knownExportFirst) / knownExportFirst > 0.1) {
-            let hsCount = 0;
-            for (const sec of data.children) {
-              for (const item of sec.children ?? []) {
-                const name = String(item.name ?? "");
-                const valueM = parseFloat(item.value ?? "0") / 1000;
-                if (valueM <= 0 || name.length < 2) continue;
-                await run(d,
-                  "INSERT INTO trade_items(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
-                  name.substring(0, 200), classifyHS(name), "import", "XX", valueM, null, "units",
-                  valueM > 10000 ? "Very High" : valueM > 3000 ? "High" : "Medium",
-                  "TradeMap / ITC", url
-                );
-                hsCount++;
-              }
+        if (data.children?.length) {
+          for (const sec of data.children) {
+            for (const item of sec.children ?? []) {
+              const name = String(item.name ?? "");
+              const valueM = parseFloat(item.value ?? "0") / 1000;
+              if (valueM <= 0 || name.length < 2) continue;
+              await run(d,
+                `INSERT INTO ${table}(product_name,category_code,trade_type,country_code,trade_value_usd,volume,unit,demand_level,source,source_url,scraped_at) VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))`,
+                name.substring(0, 200), classifyHS(name), "import", "XX", valueM, null, "units",
+                valueM > 10000 ? "Very High" : valueM > 3000 ? "High" : "Medium",
+                "TradeMap / ITC", tmUrl
+              );
+              count++;
             }
-            console.log(`[scraper:import] ${hsCount} verified HS import items`);
-            return count + hsCount;
-          } else {
-            console.log(`[scraper:import] Values match exports (first=${firstVal}), skipping`);
           }
+          console.log(`[scraper:import] ${count} HS items from treemap fallback`);
         }
       }
     }
@@ -479,6 +434,8 @@ async function scrapeTradeMapImports(d: any): Promise<number> {
     return 0;
   }
 }
+
+// ponytail: no longer needed — import treemap fallback only runs when linear chart gives nothing
 
 function classifyHS(name: string): string {
   const c = name.toLowerCase();
@@ -494,28 +451,34 @@ function classifyHS(name: string): string {
   if (c.includes("veg") || c.includes("palm") || c.includes("sunflower") || c.includes("soy") || c.includes("castor")) return "15";
   if (c.includes("toy") || c.includes("sport") || c.includes("game") || c.includes("cricket")) return "95";
   if (c.includes("machin") || c.includes("boiler") || c.includes("engine") || c.includes("equipment") || c.includes("pump") || c.includes("turbine")) return "84";
-  return "84";
+  return "00"; // ponytail: unknown — no misleading default
 }
 
-// ── Ensure categories table is seeded ──
+// ── Seed categories once ──
+let _categoriesReady: Promise<void> | null = null;
+
 async function ensureCategories(d: any) {
-  const cats = [
-    ["10","Agricultural Products","Cereals, grains, agricultural produce"],
-    ["15","Vegetable Oils","Edible oils and fats"],
-    ["27","Mineral Fuels & Oils","Petroleum, natural gas, mineral fuels"],
-    ["30","Pharmaceuticals","Drug formulations, bulk drugs, medical products"],
-    ["39","Plastics & Chemicals","Polymers, organic chemicals, plastics"],
-    ["61","Textiles & Apparel","Clothing, fabrics, textile articles"],
-    ["71","Gems & Jewelry","Diamonds, gold jewelry, precious stones"],
-    ["72","Iron & Steel","Iron, steel, and metal products"],
-    ["84","Machinery & Equipment","Industrial machinery and mechanical appliances"],
-    ["85","Electronics & Telecom","Electronic goods, telecommunications equipment"],
-    ["87","Transport Equipment","Vehicles, auto components, transport machinery"],
-    ["95","Toys & Sports","Toys, games, sporting goods"],
-  ];
-  for (const [code, name, desc] of cats) {
-    await run(d, "INSERT OR IGNORE INTO categories(hs_code,name,description) VALUES(?,?,?)", code, name, desc);
-  }
+  if (_categoriesReady) return _categoriesReady;
+  _categoriesReady = (async () => {
+    const cats = [
+      ["10","Agricultural Products","Cereals, grains, agricultural produce"],
+      ["15","Vegetable Oils","Edible oils and fats"],
+      ["27","Mineral Fuels & Oils","Petroleum, natural gas, mineral fuels"],
+      ["30","Pharmaceuticals","Drug formulations, bulk drugs, medical products"],
+      ["39","Plastics & Chemicals","Polymers, organic chemicals, plastics"],
+      ["61","Textiles & Apparel","Clothing, fabrics, textile articles"],
+      ["71","Gems & Jewelry","Diamonds, gold jewelry, precious stones"],
+      ["72","Iron & Steel","Iron, steel, and metal products"],
+      ["84","Machinery & Equipment","Industrial machinery and mechanical appliances"],
+      ["85","Electronics & Telecom","Electronic goods, telecommunications equipment"],
+      ["87","Transport Equipment","Vehicles, auto components, transport machinery"],
+      ["95","Toys & Sports","Toys, games, sporting goods"],
+    ];
+    await d.batch(cats.map(([code, name, desc]) =>
+      d.prepare("INSERT OR IGNORE INTO categories(hs_code,name,description) VALUES(?,?,?)").bind(code, name, desc)
+    ));
+  })();
+  return _categoriesReady;
 }
 
 // ── Cloudflare Workers exports ──
@@ -523,11 +486,8 @@ import indexHTML from "../public/index.html";
 
 export default {
   async fetch(request: Request, env: any, ctx: any) {
-    try {
-      await ensureCategories(env.DB);
-    } catch (e) {
-      console.error("ensureCategories failed:", e);
-    }
+    // ponytail: fire-and-forget category seed — never blocks a request
+    ctx.waitUntil(ensureCategories(env.DB).catch((e: any) => console.error("ensureCategories failed:", e)));
     const res = await app.fetch(request, env, ctx);
     // ponytail: if Hono returns 404, serve index.html (SPA fallback)
     if (res.status === 404 && !request.url.includes("/api/")) {

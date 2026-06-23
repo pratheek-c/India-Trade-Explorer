@@ -104,11 +104,7 @@ export function App() {
 
   // Initial load
   useEffect(() => {
-    Promise.all([get("/api/trade/categories?type=export"), get("/api/trade/categories?type=import")])
-      .then(([e, i]) => setTotals({
-        exp: (e as Cat[]).reduce((s, c) => s + (c.total_value_usd ?? 0), 0),
-        imp: (i as Cat[]).reduce((s, c) => s + (c.total_value_usd ?? 0), 0),
-      }));
+    // ponytail: totals computed from cats after they load (see useEffect below)
     get("/api/trade/countries").then((c: any[]) => {
       setCountries(c);
       // Build partner data with export/import/balance per country
@@ -126,7 +122,15 @@ export function App() {
     get("/api/ai/summary").then(setInsight).finally(() => setInsightLoading(false));
   }, []);
 
-  useEffect(() => { setCatsLoading(true); get(`/api/trade/categories?type=${tradeType}`).then(setCats).finally(() => setCatsLoading(false)); }, [tradeType]);
+  useEffect(() => {
+    setCatsLoading(true);
+    get(`/api/trade/categories?type=${tradeType}`).then(c => {
+      setCats(c);
+      // ponytail: update totals from the first load of each type
+      if (tradeType === 'export') setTotals(p => ({ ...p, exp: (c as Cat[]).reduce((s, x) => s + (x.total_value_usd ?? 0), 0) }));
+      else setTotals(p => ({ ...p, imp: (c as Cat[]).reduce((s, x) => s + (x.total_value_usd ?? 0), 0) }));
+    }).finally(() => setCatsLoading(false));
+  }, [tradeType]);
   useEffect(() => { fetchTrade(); }, [fetchTrade]);
 
   // Auto-scroll chat
@@ -180,7 +184,7 @@ export function App() {
                 <button key={t} onClick={() => { setTradeType(t); setPage(0); }} style={{ padding: "6px 12px", fontSize: 13, fontWeight: 500, borderRadius: 6, border: "none", cursor: "pointer", textTransform: "capitalize", background: tradeType === t ? "var(--bg)" : "transparent", color: tradeType === t ? "var(--fg)" : "var(--muted-fg)", boxShadow: tradeType === t ? "0 1px 2px rgba(0,0,0,0.1)" : "none" }}>{t}s</button>
               ))}
             </div>
-            <button onClick={triggerScrape} disabled={scraping} title="Scrape fresh data from TRADESTAT" style={{ padding: 6, borderRadius: 6, border: "none", background: "transparent", color: "var(--muted-fg)", cursor: "pointer", position: "relative" }}>
+            <button onClick={triggerScrape} disabled={scraping} title="Scrape fresh data from TradeMap" style={{ padding: 6, borderRadius: 6, border: "none", background: "transparent", color: "var(--muted-fg)", cursor: "pointer", position: "relative" }}>
               <span style={{ animation: scraping ? "spin 1s linear infinite" : "none", display: "inline-block" }}><Refresh /></span>
             </button>
             <button onClick={() => setChatOpen(!chatOpen)} title="AI Trade Analyst" style={{ padding: 6, borderRadius: 6, border: "none", background: chatOpen ? "var(--muted)" : "transparent", cursor: "pointer", color: chatOpen ? "var(--primary)" : "var(--muted-fg)" }}><Chat /></button>
@@ -415,7 +419,7 @@ export function App() {
       {scraping && (
         <div style={{ position: "fixed", bottom: 24, right: 24, padding: "12px 20px", borderRadius: 12, background: "var(--card)", border: "1px solid var(--border)", boxShadow: "0 4px 12px rgba(0,0,0,0.15)", fontSize: 13, display: "flex", alignItems: "center", gap: 8, zIndex: 100 }}>
           <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}><Refresh /></span>
-          Scraping TRADESTAT data...
+          Scraping TradeMap data...
         </div>
       )}
 
